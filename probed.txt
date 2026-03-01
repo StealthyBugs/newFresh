@@ -1,0 +1,6 @@
+https://imsearch.prod.us-west-2.ml-platform.aws.a2z.com
+http://jcs-prod.us-east-2.datax.aws.a2z.com
+https://83042.prod.us-west-2.integtest.moonraker.iot.aws.a2z.com
+https://9ddea.prod.us-west-2.integtest.moonraker.iot.aws.a2z.com
+https://0c2ed.prod.us-west-2.integtest.puller.iot.aws.a2z.com
+https://jcs-prod.us-east-2.datax.aws.a2z.com
