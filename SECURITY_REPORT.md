@@ -1178,6 +1178,111 @@ return `https://${n}.sagemaker.${o}.on.aws/projects/${r}/overview`
 
 ---
 
+**Title:** Path Traversal in Authorization Server `resourceRequest` Handler
+**Severity:** High
+**Source:** `aws-lsp-codewhisperer.js` (authorization server HTTP handler)
+**Sink:** `fs.readFile(path.join(__dirname, "resources", pathname))`
+
+**Dataflow:**
+1. Local HTTP authorization server binds to `127.0.0.1` on a dynamic port
+2. Incoming HTTP request URL is parsed: `new URL(e.url, this.origin).pathname`
+3. Pathname is passed directly into `path.join(__dirname, "resources", pathname)`
+4. `path.join()` resolves `..` segments, allowing directory escape
+5. File contents are returned in the HTTP response body
+
+**Code:**
+```javascript
+async resourceRequest(e, t) {
+    if (e.url)
+        try {
+            const r = await (0, m.readFile)(
+                u.join(__dirname, "resources", new URL(e.url, this.origin).pathname)
+            );
+            t.writeHead(200), t.end(r);
+        } catch {
+            t.writeHead(404), t.end();
+        }
+}
+```
+
+**Exploit sketch:**
+```
+GET /../../etc/passwd HTTP/1.1
+Host: 127.0.0.1:<port>
+```
+`path.join(__dirname, "resources", "../../etc/passwd")` resolves to `__dirname/../etc/passwd`, escaping the `resources` directory. Any local process, browser-based CSRF, or extension can hit this endpoint.
+
+**Fix guidance:**
+- Validate that the resolved path starts with the intended `resources` directory using `path.resolve()` + `startsWith()` check
+- Strip `..` segments from the pathname before joining
+
+---
+
+**Title:** Unsafe YAML Deserialization via `js/function` Type Enables RCE
+**Severity:** High
+**Source:** `aws-lsp-codewhisperer.js` (bundled `js-yaml` library)
+**Sink:** `new Function(args, body)` in YAML `tag:yaml.org,2002:js/function` type handler
+
+**Dataflow:**
+1. Bundle includes `js-yaml` with dangerous `js/function`, `js/regexp`, and `js/undefined` custom types
+2. The `construct` handler for `js/function` parses YAML scalar value with esprima
+3. Parsed function body and arguments are passed to `new Function()`
+4. Any code path calling `yaml.load()` with `DEFAULT_FULL_SCHEMA` on untrusted input triggers RCE
+
+**Code:**
+```javascript
+// tag:yaml.org,2002:js/function construct handler
+construct: function(e) {
+    var t, r = "(" + e + ")",
+        s = i.parse(r, { range: true });
+    // ... extracts function body
+    return new Function(o, r.slice(t[0] + 1, t[1] - 1));
+}
+```
+
+**Exploit sketch:**
+```yaml
+!!js/function 'function() { require("child_process").execSync("id > /tmp/pwned") }'
+```
+If any YAML parsing in the application uses the full schema (not `SAFE_SCHEMA`), this payload achieves arbitrary code execution.
+
+**Fix guidance:**
+- Ensure all YAML parsing uses `yaml.safeLoad()` or `DEFAULT_SAFE_SCHEMA` exclusively
+- Remove or disable the `js/function`, `js/regexp` types from the bundled schema
+- Audit all `yaml.load()` call sites
+
+---
+
+**Title:** Zip Slip Path Traversal in Bundled JSZip Library
+**Severity:** Medium
+**Source:** `aws-lsp-codewhisperer.js` (bundled JSZip library)
+**Sink:** `path.resolve(a.fileNameStr)` during zip entry processing
+
+**Dataflow:**
+1. JSZip processes zip archive entries
+2. Each entry's `fileNameStr` is passed to `path.resolve()` without path validation
+3. Malicious zip entries with `../../` prefixed filenames resolve to paths outside the extraction directory
+4. The library preserves the unsafe name as `unsafeOriginalName`, indicating awareness of the risk
+
+**Code:**
+```javascript
+for (var n = 0; n < o.length; n++) {
+    var a = o[n], u = a.fileNameStr, p = i.resolve(a.fileNameStr);
+    r.file(p, a.decompressed, { binary: true });
+    a.dir || (r.file(p).unsafeOriginalName = u);
+}
+```
+
+**Exploit sketch:**
+A crafted zip file containing an entry named `../../../tmp/cron.d/malicious` would resolve outside the intended directory when extracted and subsequently written to disk.
+
+**Fix guidance:**
+- Validate that resolved paths remain within the intended extraction directory
+- Reject zip entries containing `..` path components
+- Use `path.resolve(targetDir, entry)` and verify result `startsWith(targetDir)`
+
+---
+
 ## Metrics Summary
 
 | Category | Count |
@@ -1189,17 +1294,18 @@ return `https://${n}.sagemaker.${o}.on.aws/projects/${r}/overview`
 | Supply Chain / Code Injection | 6 |
 | Open Redirect | 2 |
 | Information Disclosure | 4 |
-| Path Traversal | 4 |
+| Path Traversal | 7 |
 | CSRF | 2 |
 | DoS | 1 |
-| Other (Config/Permissions) | 2 |
-| **Total** | **50** |
+| Deserialization RCE | 1 |
+| Other (Config/Permissions) | 1 |
+| **Total** | **53** |
 
 | Severity | Count |
 |----------|-------|
 | Critical | 6 |
-| High | 13 |
-| Medium | 25 |
+| High | 15 |
+| Medium | 26 |
 | Low | 6 |
 
 ## Files Analyzed
