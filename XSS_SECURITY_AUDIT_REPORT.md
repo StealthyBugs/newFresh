@@ -38,6 +38,8 @@
 | `nonce` query param on OAuth `/signin` | `authServer.ts:99` | URL query param |
 | WebSocket message data | `remoteExtensionHostAgentServer.ts:182+` | WebSocket frames |
 | `postMessage` data (in webview context) | `webview/pre/index.html:312` | MessagePort messages |
+| `postMessage` data (notebook webview, no origin check) | `webviewPreloads.ts:1629` | Window message (unvalidated) |
+| `postMessage` data (issue reporter, no origin check) | `issueFormService.ts:41,190,215` | Window message (unvalidated) |
 | Notebook cell outputs (`text/html`, `image/svg+xml`) | `notebook-renderers/src/index.ts:107` | File content |
 
 ### Rendering Sinks
@@ -47,7 +49,8 @@
 | CSP `script-src` header interpolation | `webClientServer.ts:392` | HTTP header injection |
 | `data-settings` HTML attribute via `asJSON` | `workbench.html:20` | HTML attribute |
 | `document.write()` in webview inner iframe | `webview/pre/index.html:1031-1032` | Full HTML write |
-| `element.innerHTML = trustedHtml` (notebook) | `notebook-renderers/src/index.ts:107` | innerHTML |
+| `element.innerHTML = trustedHtml` (notebook renderer) | `notebook-renderers/src/index.ts:107` | innerHTML |
+| `element.innerHTML = trustedHtml` (notebook webview) | `webviewPreloads.ts:1629` (passthrough TrustedTypes) | innerHTML |
 | `domEval(element)` (notebook script execution) | `notebook-renderers/src/index.ts:124` | Script execution |
 | `execCommand(data)` in webview | `webview/pre/index.html:1214` | DOM command |
 | `mainWindow.location.href = href` | `openerService.ts:126` | Navigation/JS execution |
@@ -221,6 +224,24 @@
 - **Confidence:** HIGH
 - **False-positive notes:** Same prerequisites as XSS-01 (same-hostname attacker).
 
+### XSS-06: Notebook Webview postMessage → innerHTML (No Origin Check) (MEDIUM)
+
+- **Type:** postMessage DOM XSS
+- **File:** `src/vs/workbench/contrib/notebook/browser/view/renderers/webviewPreloads.ts:1629`
+- **User-controlled input:** `window.addEventListener('message', ...)` with **no `event.origin` or `event.source` check**
+- **Unsafe sink:** `element.innerHTML = trustedHtml` where the TrustedTypes policy is a passthrough (`createHTML: value => value` — zero sanitization)
+- **Full taint path:**
+  1. `window.addEventListener('message', ...)` — no origin validation at line 1629
+  2. Message type `'html'` dispatches to `viewModel.renderOutputCell(data)`
+  3. `content.htmlContent` → `ttPolicy.createHTML(content.htmlContent)` — passthrough policy
+  4. `element.innerHTML = trustedHtml` — arbitrary HTML injection
+- **Why existing sanitization fails:** TrustedTypes policy is `createHTML: value => value` — it's a spec-compliance wrapper with no actual sanitization. No CSP or DOMPurify applied.
+- **Mitigating factors:** Runs inside a sandboxed webview iframe (`sandbox="allow-scripts allow-same-origin"`) on a separate hash-based origin. Escape to the main VS Code window requires a same-origin bypass.
+- **Exploitable in modern browsers:** Yes — within the notebook webview context. A malicious renderer extension or cross-cell content can inject arbitrary HTML/JS into other notebook output cells.
+- **Impact:** Cross-cell XSS within the notebook webview. Script execution within the sandboxed iframe. Cannot directly escape to the main VS Code window due to iframe sandbox.
+- **Confidence:** HIGH
+- **False-positive notes:** The code comments acknowledge this: "renderer extensions are responsible for sanitizing their content themselves." This is by-design trust delegation, not accidental.
+
 ---
 
 ## C) Confirmed XSS-Enabling Findings
@@ -251,6 +272,15 @@ These are not directly exploitable XSS but significantly amplify the impact of o
 - **Issue:** `asJSON` only escapes `"` → `&quot;`. Does NOT escape `<`, `>`, `&`.
 - **Current status:** NOT exploitable because the value is in a double-quoted HTML attribute on a `<meta>` tag, where `<>` are inert per HTML5 spec. `&quot;` correctly prevents attribute breakout.
 - **Risk:** If the template is ever refactored to place this JSON inside a `<script>` tag, `</script>` injection would immediately work. CSP hashes are computed AFTER template substitution, so CSP would not protect.
+
+### XSS-EN-05: Issue Reporter postMessage Listeners Without Origin Validation (LOW)
+
+- **Files:** `issueFormService.ts:41,190,215` and `issueReporterModel.ts:62`
+- **Issue:** Four `window.addEventListener('message', ...)` listeners with **no `event.origin` check**:
+  - Listener at `:41` matches `sendChannel === 'vscode:triggerReporterMenu'` and calls `action.run()` for matching extension IDs — a cross-origin message could trigger extension menu actions
+  - Listener at `:62` responds to `vscode:triggerIssueData` with `postMessage({...}, '*')` — leaks issue data (title, body) to **any origin**
+- **Impact:** Cross-origin action triggering on the issue reporter page, and information leakage of issue data. Limited by the issue reporter running in a separate webview context.
+- **Recommended fix:** Add `event.origin` validation to all four listeners. Replace `postMessage(..., '*')` with a specific target origin.
 
 ---
 
@@ -345,7 +375,7 @@ Tested scenarios: double-encoding (`%3C`), Unicode escapes (`\u003c`), HTML enti
 | 33 | Encoding bypass scenarios (8 tests) | All blocked by JSON.stringify + `&quot;` + HTML5 parsing |
 | 34 | localStorage/sessionStorage flows | Safe — JSON.stringify before storage, no rendering |
 | 35 | innerHTML grep across codebase | Notebook renderers use innerHTML (by design, sandboxed webview) |
-| 36 | postMessage listeners grep | MessageChannel (private) for webviews; `imagePreview.js` has proper origin check |
+| 36 | postMessage listeners grep (31 listeners, 24 files) | 26/31 safe (MessageChannel/Worker/origin-checked); 1 exploitable (notebook webviewPreloads.ts innerHTML); 4 risky (issueFormService/issueReporterModel no origin check) |
 | 37 | URL fragment/hash flows | No hash-based XSS flows found |
 | 38 | Web extension resource proxy | Suffix-match bypass (XSS-04), same-origin HTML serving |
 | 39 | Notebook `text/html` rendering | Raw innerHTML + `domEval` in sandboxed webview; gated by Workspace Trust |
@@ -362,6 +392,7 @@ Tested scenarios: double-encoding (`%3C`), Unicode escapes (`\u003c`), HTML enti
 | **XSS-03** | Cookie → `javascript:` → `location.href` | **HIGH** | MEDIUM-HIGH | Cookie poisoning |
 | **XSS-04** | Same-origin HTML proxy | **HIGH** | MEDIUM | Subdomain control + connection token |
 | **XSS-05** | Extension host iframe origin bypass | **HIGH** | HIGH | Same-hostname attacker presence |
+| **XSS-06** | Notebook webview postMessage → innerHTML | **MEDIUM** | HIGH | Malicious renderer extension or cross-cell content |
 
 ### Recommended Priority Fixes
 
@@ -369,5 +400,7 @@ Tested scenarios: double-encoding (`%3C`), Unicode escapes (`\u003c`), HTML enti
 2. **XSS-02:** Validate `remoteAuthority` with strict regex `/^[\w.:-]+$/` before CSP interpolation. Never interpolate untrusted input into security headers.
 3. **XSS-03:** Add scheme allowlist (`https:` only) on `redirectURL` before passing to `openExternal`. Block `javascript:`, `data:`, `vbscript:` schemes in `openerService`.
 4. **XSS-04:** Validate full authority (not just suffix) against an allowlist. Add `Content-Type` restriction (only allow known-safe MIME types). Set `X-Content-Type-Options: nosniff` and restrictive CSP on proxied responses.
-5. **XSS-EN-01:** Add `httpOnly` and `secure` flags to the connection token cookie.
-6. **XSS-EN-04:** Enhance `asJSON` to escape `<` → `\u003C` and `>` → `\u003E` for defense-in-depth.
+5. **XSS-06:** Add `event.origin` validation to the notebook webview `window.addEventListener('message')` listener. Replace passthrough TrustedTypes policy with actual HTML sanitization (e.g., DOMPurify).
+6. **XSS-EN-01:** Add `httpOnly` and `secure` flags to the connection token cookie.
+7. **XSS-EN-04:** Enhance `asJSON` to escape `<` → `\u003C` and `>` → `\u003E` for defense-in-depth.
+8. **XSS-EN-05:** Add `event.origin` validation to all issue reporter postMessage listeners. Replace `postMessage(..., '*')` with specific target origin.
