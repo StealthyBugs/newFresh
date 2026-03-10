@@ -1,10 +1,12 @@
 # Security Audit Report: aws/sagemaker-code-editor
 
-**Scope:** Source-code-only security review (no live exploitation)
+**Scope:** Source-code-only security review + selective live testing on deployed SageMaker instance
 **Target:** https://github.com/aws/sagemaker-code-editor
-**Date:** 2026-03-01
+**Date:** 2026-03-01 (updated 2026-03-10 with live testing results)
 **Bug Classes (strict):** SQL Injection, JWT Verification Bypass, Remote Code Execution / Code Injection, XSS (reflected/stored/DOM), Server-Side Template Injection (SSTI)
 **Methodology:** 30+ specialized agents with two-agent-per-file verification and 5 cross-file connection agents
+
+**Live Testing Note (2026-03-10):** Selective live testing on a deployed SageMaker instance revealed that the bundling/build process introduces code differences from the GitHub source. Notably, VULN-10 (SSRF) is **not exploitable** on the deployed instance due to a bundler refactoring that lost a `+1` path offset. Additionally, an undocumented `/api/poststartup` endpoint exists only in the deployed bundle (VULN-21). VULN-04 severity is elevated when `--without-connection-token` is used, as it removes all authentication from the file-read endpoint. See individual findings for details.
 
 ---
 
@@ -126,7 +128,13 @@ A patched VS Code (v1.90.1) distribution for AWS SageMaker. Architecture: git su
   - `remoteExtensionHostAgentServer.ts:169` → `webClientServer.ts:82` — `createReadStream(filePath).pipe(res)`
 - **Dataflow:** `query['path']` → `URI.from().fsPath` → `serveFile()` → `createReadStream().pipe(res)`
 - **Exploitability via GET:** Yes (requires valid connection token). Reads `/etc/passwd`, `/proc/self/environ`, `~/.aws/credentials`, etc.
-- **Recommended fix:** Add path allowlist check (restrict to extension directories and workspace), or accept the risk as intentional design with clear documentation.
+- **`--without-connection-token` escalation:** When the server is started with `--without-connection-token`, `NoneServerConnectionToken.validate()` always returns `true` (`serverConnectionToken.ts:24-30`). This makes the endpoint **completely unauthenticated** — any network-reachable attacker can read arbitrary files with no token required.
+- **Live Testing:** Verify on deployed instance with:
+  ```
+  curl http://localhost:8888/vscode-remote-resource?path=/etc/passwd
+  curl http://localhost:8888/oss-unknown/vscode-remote-resource?path=/etc/passwd
+  ```
+- **Recommended fix:** Add path allowlist check (restrict to extension directories and workspace), or accept the risk as intentional design with clear documentation. Never use `--without-connection-token` in production.
 
 ### VULN-05: Post-Auth SSRF via WebSocket Tunnel (Network Pivot)
 
@@ -203,6 +211,13 @@ A patched VS Code (v1.90.1) distribution for AWS SageMaker. Architecture: git su
 - **Dataflow:** pathname → `URI.parse()` → authority suffix check → `requestService.request({ url })` → response proxied back
 - **Exploitability via GET:** Yes (with connection token). Attacker can reach any subdomain matching the gallery suffix.
 - **Recommended fix:** Validate full authority against an allowlist, not just the suffix.
+- **Live Testing Results (Deployed Instance):**
+  - **Status: NOT EXPLOITABLE on deployed SageMaker instance**
+  - The bundled code uses `n.substring(_u.length)` instead of the source code's `substring(route.length + 1)`
+  - The missing `+1` means the parsed path retains a leading `/` → empty authority after `URI.parse()` → always fails the suffix validation
+  - This is a bundler refactoring artifact that inadvertently mitigates the vulnerability
+  - No bypass is possible: route matching enforces `/` at the boundary, so `_u.length` always points at the `/`, and the resulting URI always has an empty authority
+  - **Severity adjustment:** Source Code = MEDIUM, Deployed Instance = NOT EXPLOITABLE
 
 ### VULN-11: Missing `return` After Nonce Failure in OAuth `/signin`
 
@@ -312,6 +327,24 @@ A patched VS Code (v1.90.1) distribution for AWS SageMaker. Architecture: git su
   - Mitigated by: `new URL()` normalization, localhost-only binding, ephemeral lifetime
 - **Exploitability via GET:** Yes (localhost only)
 - **Recommended fix:** Add `isEqualOrParent` containment check after `path.join`.
+
+### VULN-21: Undocumented `/api/poststartup` Endpoint (Deployed-Only, Investigation Required)
+
+- **Severity:** UNKNOWN (requires further investigation)
+- **Affected endpoint:** GET/POST `/api/poststartup`
+- **Inputs:** Unknown
+- **Evidence:**
+  - The bundled deployed code contains route `NR="/api/poststartup"` which does **NOT** exist in the GitHub source code
+  - This endpoint was introduced during the SageMaker build/bundling process
+  - The handler logic is only present in the minified bundle, not in the open-source repository
+- **Concern:** Undocumented endpoints added at build time bypass open-source security review. The handler's functionality, authentication requirements, and input handling are unknown.
+- **Recommended action:** Reverse-engineer the bundled handler for `/api/poststartup`; verify authentication gating; document the endpoint's purpose and security posture.
+- **Live Testing:** Probe on deployed instance with:
+  ```
+  curl -v http://localhost:8888/api/poststartup
+  curl -v -X POST http://localhost:8888/api/poststartup
+  curl -v http://localhost:8888/oss-unknown/api/poststartup
+  ```
 
 ---
 
